@@ -14,8 +14,61 @@
 #include <linux/file.h>
 #include <linux/err.h>
 #include <linux/fs.h>
+#include <linux/slab.h>
 
 static inline bool spacetab(char c) { return c == ' ' || c == '\t'; }
+
+static const char origin_prefix[] = "${ORIGIN}/";
+#define ORIGIN_PREFIX_LEN (sizeof(origin_prefix) - 1)
+
+/*
+ * If the interpreter path starts with `origin_prefix`, expand it to the directory
+ * containing the script, mirroring `${ORIGIN}` expansion in ELF RPATH/RUNPATH.
+ * Resolves symlinks in the script path via bprm->file, matching ELF $ORIGIN semantics.
+ * Returns a kmalloc'd string on success, ERR_PTR on failure.
+ */
+static char *expand_origin(const char *interp, struct linux_binprm *bprm)
+{
+	const char *last_slash, *suffix;
+	char *path_buf, *real_path, *result;
+	size_t dir_len, suffix_len, result_len;
+
+	path_buf = kmalloc(PATH_MAX, GFP_KERNEL);
+	if (!path_buf)
+		return ERR_PTR(-ENOMEM);
+
+	real_path = file_path(bprm->file, path_buf, PATH_MAX);
+	if (IS_ERR(real_path)) {
+		kfree(path_buf);
+		return ERR_CAST(real_path);
+	}
+
+	last_slash = strrchr(real_path, '/');
+	dir_len = last_slash ? last_slash - real_path : 0;
+
+	suffix = interp + ORIGIN_PREFIX_LEN;
+	suffix_len = strlen(suffix);
+	result_len = dir_len + 1 + suffix_len + 1;
+
+	if (result_len > PATH_MAX) {
+		kfree(path_buf);
+		return ERR_PTR(-ENAMETOOLONG);
+	}
+
+	result = kmalloc(result_len, GFP_KERNEL);
+	if (!result) {
+		kfree(path_buf);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	memcpy(result, real_path, dir_len);
+	result[dir_len] = '/';
+	memcpy(result + dir_len + 1, suffix, suffix_len + 1);
+
+	kfree(path_buf);
+	return result;
+}
+
 static inline const char *next_non_spacetab(const char *first, const char *last)
 {
 	for (; first <= last; first++)
@@ -34,6 +87,7 @@ static inline const char *next_terminator(const char *first, const char *last)
 static int load_script(struct linux_binprm *bprm)
 {
 	const char *i_name, *i_sep, *i_arg, *i_end, *buf_end;
+	char *i_name_buf = NULL;
 	struct file *file;
 	int retval;
 
@@ -118,23 +172,35 @@ static int load_script(struct linux_binprm *bprm)
 			return retval;
 		bprm->argc++;
 	}
+	if (strncmp(i_name, origin_prefix, ORIGIN_PREFIX_LEN) == 0) {
+		i_name_buf = expand_origin(i_name, bprm);
+		if (IS_ERR(i_name_buf))
+			return PTR_ERR(i_name_buf);
+		i_name = i_name_buf;
+	}
+
 	retval = copy_string_kernel(i_name, bprm);
 	if (retval)
-		return retval;
+		goto out;
 	bprm->argc++;
 	retval = bprm_change_interp(i_name, bprm);
 	if (retval < 0)
-		return retval;
+		goto out;
 
 	/*
 	 * OK, now restart the process with the interpreter's dentry.
 	 */
 	file = open_exec(i_name);
-	if (IS_ERR(file))
-		return PTR_ERR(file);
+	if (IS_ERR(file)) {
+		retval = PTR_ERR(file);
+		goto out;
+	}
 
 	bprm->interpreter = file;
-	return 0;
+	retval = 0;
+out:
+	kfree(i_name_buf);
+	return retval;
 }
 
 static struct linux_binfmt script_format = {
